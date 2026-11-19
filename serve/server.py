@@ -5110,6 +5110,9 @@ class Service:
     def _session_turn(self, key: str, cancel: threading.Event) -> Iterator[tuple[str, object]]:
         beat = time.monotonic()
         said = False
+        deadline = beat + self.queue_timeout_s if self.queue_timeout_s is not None else None
+        if deadline is not None:
+            setattr(cancel, "_strata_queue_deadline", deadline)
         while True:
             with self.admission_changed:
                 if cancel.is_set():
@@ -5117,6 +5120,8 @@ class Service:
                 if key not in self.sessions:
                     self.sessions.add(key)
                     return True
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                 self.admission_changed.wait(timeout=0.5)
             if not said:
                 said = True
@@ -6418,7 +6423,9 @@ class Service:
         rate = collections.deque(maxlen=32) if par else self.rate
         request_id = uuid.uuid4().hex[:12]
         setattr(cancel, "_strata_request_id", request_id)
-        deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
+        deadline = getattr(cancel, "_strata_queue_deadline", None)
+        if deadline is None and self.queue_timeout_s is not None:
+            deadline = time.monotonic() + self.queue_timeout_s
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
         def queue_started():
