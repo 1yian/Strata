@@ -185,7 +185,7 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   refused at once with a 400, as before (a retry of it would fail the same way).
 - **One request per session at a time (opt-in).** With `"one_request_per_session": true` in the config, a request that
   carries a session header (`x-session-affinity`, `x-session-id` or `session_id`) waits for the same session's earlier
-  request to finish before it is queued; requests without one are not held back. Pi sends `x-session-affinity` when the
+  request to finish before it is queued; requests without one are not held back. With `--queue-timeout` set, that wait ends with the same `queue_wait_timeout` error once the deadline passes. Pi sends `x-session-affinity` when the
   provider's `compat` has `"sendSessionAffinityHeaders": true`. A client that gives every call the same session value
   would be served one request at a time, so check what yours sends first.
 - **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation
