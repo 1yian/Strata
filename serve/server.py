@@ -86,6 +86,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
+from serve import admission  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -367,6 +368,14 @@ try:
 except ValueError:
     ADMIT_SHORT_FIRST = 0
 ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
+
+
+def admit_rank(prompt_tokens: int, waited_s: float) -> int:
+    if ADMIT_SHORT_FIRST <= 0:
+        return 0
+    return 0 if prompt_tokens <= ADMIT_SHORT_FIRST or waited_s >= ADMIT_MAX_WAIT_S else 1
+
+
 # STRATA_COALESCE_PREFILL=N (research, PAR-H; needs the engine's BCO / BCOK lines): a request that takes the control lines
 # for its admission also sends the prompts of up to N-1 requests still waiting for them (BCO <slot> <ids>, into free slots
 # it reserves for them); the engine reads all the prompts in ONE layer-major pass, so the experts a layer streams are
@@ -461,6 +470,14 @@ class ModelBusy(RuntimeError):
 
 class QueueWaitExpired(RuntimeError):
     """An inference call waited too long for its first engine turn."""
+
+
+class QueueRefused(QueueWaitExpired):
+    code = "queue_wait_budget"
+
+    def __init__(self, message, retry_after):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class QueueCancelled(RuntimeError):
@@ -1326,6 +1343,7 @@ class StrataEngine:
             self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
             self.par_counters = {"queued": 0, "queue_wait_s": 0.0}
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+            self.slot_wait: list[list] = []
             self.arrivals = collections.deque(maxlen=64)   # monotonic times of the last requests that came for the control lines (STRATA_COALESCE_*)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
@@ -2116,17 +2134,16 @@ class StrataEngine:
             print(f"[strata] coalesce: {len(picked)} waiting prompt(s) ({total - len(lead_prompt)} tokens) read with this "
                   f"request's {len(lead_prompt)}", flush=True)
 
-    def _admit_next(self):
+    def _admit_next(self, entries=None):
         """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
         next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
         each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
         Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
         now = time.monotonic()
-        ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
+        ordered = [e for e in (self.wait_lens if entries is None else entries) if len(e) > 2 and e[2]]
         if not ordered:
             return None
-        return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
-                                           e[1]))
+        return min(ordered, key=lambda e: (admit_rank(e[0], now - e[1]), e[1]))
 
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
@@ -2177,6 +2194,8 @@ class StrataEngine:
             if isinstance(hold, tuple) and len(hold) == 2 and hold[0] > 0 and hold[1] >= 0 and hold[1] not in out:
                 return keys0 + f" hold={max(1, hold[0] - len(out))}:{hold[1]}"
             return keys0
+        arrived = time.monotonic()
+        slot_entry = None
         orig_len = len(prompt)  # a leg that continues (prompt + what it generated) names where the reply began: pen_from, the penalty window's start
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
@@ -2282,13 +2301,27 @@ class StrataEngine:
                         # With none free the control lines are given back while waiting: a slot can be held by a read
                         # that gave way (BYIELD) and needs them to go on, so waiting with them is a deadlock - long,
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
+                        beat = time.monotonic()
+
+                        def slot_for_me():
+                            if slot_entry is not None and self._admit_next(self.slot_wait) is not slot_entry:
+                                return None
+                            return self.pick_slot(prompt)
+
                         while True:
                             deadline = getattr(cancel, "_strata_queue_deadline", None)
                             if deadline is not None and time.monotonic() >= deadline:
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                if slot_entry is None and ADMIT_SHORT_FIRST > 0 and not out:
+                                    slot_entry = [len(prompt), arrived, True, None, cancel]
+                                    self.slot_wait.append(slot_entry)
+                                slot = slot_for_me()
                                 if slot is not None:
+                                    if slot_entry is not None:
+                                        self.slot_wait.remove(slot_entry)
+                                        slot_entry = None
+                                        self.slot_cv.notify_all()
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
                                     if admit_wait:
@@ -2305,7 +2338,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if slot_for_me() is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -2316,11 +2349,14 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if slot_for_me() is None:
                                     wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
                                     self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
                             if cancel.is_set():
                                 return
+                            if time.monotonic() - beat >= QUEUE_BEAT_S:
+                                beat = time.monotonic()
+                                yield None
                             if not holding:
                                 ok = yield from self._take_control(cancel, len(prompt))
                                 if not ok:
@@ -2542,6 +2578,11 @@ class StrataEngine:
             if admit_wait:
                 with self.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
+            if slot_entry is not None:
+                with self.slot_cv:
+                    if slot_entry in self.slot_wait:
+                        self.slot_wait.remove(slot_entry)
+                    self.slot_cv.notify_all()
             if reserved is not None and same:
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
@@ -4910,6 +4951,11 @@ class Service:
         # while a model is loading or a request is between MCP rounds; the engine's own slots remain unchanged.
         self.max_queue: int | None = None
         self.queue_timeout_s: float | None = None
+        self.queue_budget_s: float | None = None
+        self.queue_refused = 0
+        self.one_per_session = False
+        self.sessions: set[str] = set()
+        self.read_started: dict[str, float] = {}
         self.admission_reserved = 0
         self.admission_rejected = 0
         self.queue_timeouts = 0
@@ -5025,6 +5071,59 @@ class Service:
                 return False
             self.admission_reserved += 1
             return True
+
+    def estimate_wait_s(self, prompt_tokens: int) -> float:
+        slots = max(1, int(getattr(self.engine, "batch", 0) or 0))
+        now = time.time()
+        with self.status_lock:
+            rows = [dict(row, started_at=self.read_started.get(row["id"])) for row in self.terminal_requests.values()]
+            totals = dict(self.totals)
+        mine = admit_rank(prompt_tokens, 0.0)
+        remaining, ahead = [], []
+        for row in rows:
+            need = admission.service_s(totals, row["prompt_tokens"])
+            if row["state"] in ("queued", "waiting"):
+                if admit_rank(row["prompt_tokens"], now - row["queued_at"]) <= mine:
+                    ahead.append(need)
+            else:
+                began = row.get("started_at") or row.get("admitted_at") or row["queued_at"]
+                remaining.append(max(need - (now - began), need / 2))
+        return admission.estimate_wait(slots, remaining, ahead)
+
+    def admit(self, cancel: threading.Event, prompt_tokens: int, headers) -> None:
+        key = admission.session_key(headers) if self.one_per_session else None
+        if key:
+            setattr(cancel, "_strata_session", key)
+        if self.queue_budget_s is None:
+            return
+        wait = self.estimate_wait_s(prompt_tokens)
+        if wait <= self.queue_budget_s:
+            return
+        retry_after = max(1, min(3600, math.ceil(wait - self.queue_budget_s)))
+        with self.status_lock:
+            self.queue_refused += 1
+        print(f"[strata] refused: a request of {prompt_tokens} prompt tokens would wait about {wait:.0f} s for a slot, "
+              f"over the queue budget of {self.queue_budget_s:g} s (retry in {retry_after} s)", flush=True)
+        raise QueueRefused(f"this request would wait about {wait:.0f}s for the engine, more than this server's queue "
+                           f"budget of {self.queue_budget_s:g}s; retry in about {retry_after}s", retry_after)
+
+    def _session_turn(self, key: str, cancel: threading.Event) -> Iterator[tuple[str, object]]:
+        beat = time.monotonic()
+        said = False
+        while True:
+            with self.admission_changed:
+                if cancel.is_set():
+                    return False
+                if key not in self.sessions:
+                    self.sessions.add(key)
+                    return True
+                self.admission_changed.wait(timeout=0.5)
+            if not said:
+                said = True
+                print(f"[strata] session {key[:12]}: a request waits for the same session's earlier one to finish", flush=True)
+            if time.monotonic() - beat >= QUEUE_BEAT_S:
+                beat = time.monotonic()
+                yield "ping", None
 
     def release_inference(self) -> None:
         with self.admission_changed:
@@ -6214,9 +6313,21 @@ class Service:
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
+        key = getattr(cancel, "_strata_session", None)
+        held = False
         try:
+            if key:
+                held = yield from self._session_turn(key, cancel)
+                if not held:
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                                   "reasoning_tokens": 0, "reasoning_recoveries": 0}
+                    return
             yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
         finally:
+            if held:
+                with self.admission_changed:
+                    self.sessions.discard(key)
+                    self.admission_changed.notify_all()
             if ka is not None:
                 ka.release()
 
@@ -6315,6 +6426,7 @@ class Service:
                 row = self.terminal_requests.get(request_id)
                 if row is not None and row["state"] != "reading":
                     row["state"] = "reading"
+                    self.read_started[request_id] = time.time()
                     self._terminal_event_locked(request_id, "reading")
         setattr(cancel, "_strata_queue_started", queue_started)
         def replica_selected(index: int) -> None:
@@ -6756,6 +6868,7 @@ class Service:
                 if queued_counted:
                     self.status["queued"] -= 1
                 self.terminal_requests.pop(request_id, None)
+                self.read_started.pop(request_id, None)
                 event = {"stop": "finished", "length": "finished", "cancel": "cancelled",
                          "disconnect": "disconnected", "timeout": "timeout", "error": "error"}.get(finish, "error")
                 self._terminal_event_locked(request_id, event, finish)
@@ -7988,6 +8101,7 @@ def make_handler(svc: Service):
                     snapshot["rates"]["output_tokens_server_counter"] = output_counter
                     snapshot["work"]["requests_omitted"] = max(0, len(active) - 50)
                     snapshot["work"].update(max_queue=svc.max_queue, queue_timeout_s=svc.queue_timeout_s,
+                                            queue_budget_s=svc.queue_budget_s, queue_refused=svc.queue_refused,
                                             queue_timeouts=queue_timeouts,
                                             client_disconnect_cancels=client_disconnect_cancels,
                                             admission_limit=svc.admission_limit(),
@@ -8356,11 +8470,12 @@ def make_handler(svc: Service):
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except QueueWaitExpired as e:
-                error = {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}
+                code = getattr(e, "code", "queue_wait_timeout")
+                error = {"type": "rate_limit_error", "code": code, "message": str(e)}
                 self._note(error=error)
-                body = responses_error_body(str(e), "server_error", code="queue_wait_timeout") \
+                body = responses_error_body(str(e), "server_error", code=code) \
                     if path == "/v1/responses" else {"error": error}
-                self._json(429, body, retry_after=1)
+                self._json(429, body, retry_after=getattr(e, "retry_after", 1))
             except StructuredOutputError as e:
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                           "message": str(e)}})
@@ -8690,6 +8805,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            svc.admit(cancel, len(ids), self.headers)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
@@ -8893,6 +9009,7 @@ def make_handler(svc: Service):
             except ValueError as e:                          # too long for the context, an image without vision
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
+            svc.admit(cancel, len(ids), self.headers)
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
@@ -8930,6 +9047,7 @@ def make_handler(svc: Service):
                 ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             except ContextOverflow as e:
                 raise ValueError(e.anthropic_text()) from None       # #4838: Anthropic's own wording first, Strata's sentence after it
+            svc.admit(cancel, len(ids), self.headers)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, callable_tools, max_new, cancel, force=force,
                                       deferred=deferred)
@@ -9980,6 +10098,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                     help="maximum inference calls waiting beyond effective engine slots; 0 refuses overload")
     ap.add_argument("--queue-timeout", type=float, default=None,
                     help="maximum seconds waiting for the first engine turn (0.1..600; off by default)")
+    ap.add_argument("--queue-budget", type=float, default=None,
+                    help="refuse a request (HTTP 429 with Retry-After) whose estimated wait for an engine slot is over "
+                         "this many seconds (1..3600; off by default)")
     ap.add_argument("--batch-telemetry", action=argparse.BooleanOptionalAction, default=None,
                     help="opt in to low-rate engine decode-window samples for /v1/telemetry")
     ap.add_argument("--offline", action="store_true",
@@ -10075,6 +10196,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                                                           config_bytes, launch_args)
     if "batch_telemetry" in cfg and type(cfg["batch_telemetry"]) is not bool:
         ap.error("batch_telemetry must be true or false")
+    if "one_request_per_session" in cfg and type(cfg["one_request_per_session"]) is not bool:
+        ap.error("one_request_per_session must be true or false")
     try:
         ready_path = ready_file.preflight(a.ready_file) if a.ready_file else None
     except ValueError as e:
@@ -10089,6 +10212,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         ap.error("--queue-timeout / queue_timeout must be finite seconds in 0.1..600")
     if queue_timeout is not None and max_queue is None:
         ap.error("--queue-timeout requires --max-queue / max_queue to bound pending calls")
+    queue_budget = a.queue_budget if a.queue_budget is not None else cfg.get("queue_budget")
+    if queue_budget is not None and (isinstance(queue_budget, bool) or not isinstance(queue_budget, (int, float))
+                                     or not math.isfinite(queue_budget) or not 1 <= queue_budget <= 3600):
+        ap.error("--queue-budget / queue_budget must be finite seconds in 1..3600")
     if a.parallel is not None:
         if a.parallel < 1 or a.parallel > 1024:
             ap.error("--parallel must be in 1..1024; the engine may reduce it to the supported count")
@@ -10283,6 +10410,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.offline = a.offline
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
+    svc.queue_budget_s = float(queue_budget) if queue_budget is not None else None
+    svc.one_per_session = cfg.get("one_request_per_session") is True
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
         svc.set_family(None)

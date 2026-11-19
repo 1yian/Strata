@@ -122,7 +122,7 @@ decodes alone.
 | `STRATA_BATCH_SELF_COMMIT=1` | a one-row-per-slot window advances the GDN state itself, no commit graph |
 | `STRATA_QSA_SLOTS=1` | a window's QSA block scores, top-k and attention run as one launch over its rows |
 | `STRATA_HANDOFF_PIPE=P` | a layer split hands a prompt chunk to the next card in P pieces (2..16), gated by events, on a persistent thread |
-| `STRATA_ADMIT_SHORT_FIRST=N` (server) | a new prompt of at most N tokens takes the control lines before longer ones (a longer one that waited `STRATA_ADMIT_MAX_WAIT_S`, default 30, counts as short) |
+| `STRATA_ADMIT_SHORT_FIRST=N` (server) | a new prompt of at most N tokens takes the control lines, and a slot that frees, before longer ones (a longer one that waited `STRATA_ADMIT_MAX_WAIT_S`, default 30, counts as short) |
 | `STRATA_TRACE=1` | one line per admission with its phases (drain, prompt, first window, slot copy, checkpoint copy) |
 | `STRATA_MMQ_DIRECT=1`, `STRATA_MMQ_GROUP_SORT=1` | CUDA, needs the build option `-DSTRATA_MMQ_TAB=ON`: the prompt MMQ reads resident experts in their cache slots; full MMQ groups sorted by row count (docs/DETAILS.md) |
 
@@ -171,7 +171,23 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   built for another conversation then, but measured it accepted as many drafts (140 of 172) as a draft layer that
   read the conversation (140 of 173).
 - **More requests than slots** wait for a free one (`/metrics` -> `live.slots` shows each slot: idle, reading or
-  decoding, its tokens and tok/s; `live.running` the requests in flight).
+  decoding, its tokens and tok/s; `live.running` the requests in flight). A streaming request that waits sends an SSE
+  comment (`: keep-alive`) every 10 seconds, so a client's stream idle timeout (Node's fetch gives up after 300 s of
+  silence) does not end it. With `STRATA_ADMIT_SHORT_FIRST=N` the freed slot goes to the waiting request with a prompt
+  of at most N tokens first, then to the others in arrival order; one that has waited `STRATA_ADMIT_MAX_WAIT_S` counts
+  as short, so a long prompt is never starved.
+- **A request that would wait too long is refused at once.** With `"queue_budget": S` in the config (or
+  `--queue-budget S`, 1 to 3600 seconds) the server estimates how long a new request waits for a slot - the requests
+  running and the ones ahead of it, each at the read and decode speed this server has measured and an average answer
+  length - and answers HTTP 429 with a `Retry-After` header and an OpenAI-style error (`code: queue_wait_budget`) when
+  that is over S. The reply is sent before any work is queued, so a client that moves on to another model does not
+  wait. `/v1/telemetry` shows `queue_budget_s` and `queue_refused`. A request that does not fit the context is
+  refused at once with a 400, as before (a retry of it would fail the same way).
+- **One request per session at a time (opt-in).** With `"one_request_per_session": true` in the config, a request that
+  carries a session header (`x-session-affinity`, `x-session-id` or `session_id`) waits for the same session's earlier
+  request to finish before it is queued; requests without one are not held back. Pi sends `x-session-affinity` when the
+  provider's `compat` has `"sendSessionAffinityHeaders": true`. A client that gives every call the same session value
+  would be served one request at a time, so check what yours sends first.
 - **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation
   checkpoints included) and produces its first token there; the state is then copied into the slot. Admissions
   are taken one at a time, and **the slots decode between the prompt's chunks**: after each chunk (`--prefill`,
