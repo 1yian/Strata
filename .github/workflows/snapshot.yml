@@ -47,7 +47,7 @@ concurrency:
 jobs:
   snapshot:
     name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && startsWith(matrix.os, 'ubuntu') && fromJSON('["self-hosted","p620-ci"]') || matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false

@@ -216,3 +216,4 @@ module.exports = {
   checkIssue, checkPull, checkItem, checklist,
   intakeComment, reopenMissingComment, reopenOkComment, staleComment,
 };
+
